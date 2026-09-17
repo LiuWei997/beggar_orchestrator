@@ -4,7 +4,9 @@ from .base import LLMProvider
 
 
 class OpenRouterProvider(LLMProvider):
-    default_model = "dots-studio/dots-3-note-preview:free"
+    # OpenRouter keeps this router pointed at its current pool of free models.
+    # It also filters candidates by capabilities required by the request.
+    default_model = "openrouter/free"
 
     def __init__(
         self, *, name: str = "openrouter", token: str | None, model: str | None = None

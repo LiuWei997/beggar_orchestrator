@@ -8,7 +8,7 @@ agent.py          公開 Agent API 與 async context 資源管理
 execution.py      單次 SSE 執行、fallback、timeout、cancel 與結果保留
 lifecycle.py      狀態、snapshot、transition 與狀態機規則
 messages.py       Message 型別、role 驗證與 system message 注入
-runtime.py        Provider/Route 集合、circuit breaker 與 lifecycle callback
+runtime.py        Provider/Route 集合與 lifecycle callback
 config.py         TOML cache、token 讀取、Provider/Route 建置、認證 CLI
 providers/        各 LLM API 的協定實作
 ```

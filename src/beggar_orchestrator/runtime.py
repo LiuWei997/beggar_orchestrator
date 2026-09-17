@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import inspect
-import time
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -28,34 +27,6 @@ class Route:
     deadline_seconds: float = 60
 
 
-class ProviderCircuitBreaker:
-    """Temporarily skip providers after repeated retryable failures."""
-
-    def __init__(self, threshold: int = 3, cooldown_seconds: float = 60):
-        self.threshold = threshold
-        self.cooldown_seconds = cooldown_seconds
-        self.failures: dict[str, int] = {}
-        self.open_until: dict[str, float] = {}
-
-    def allows(self, provider: str) -> bool:
-        until = self.open_until.get(provider, 0)
-        if until and time.monotonic() < until:
-            return False
-        if until:
-            self.record_success(provider)
-        return True
-
-    def record_success(self, provider: str) -> None:
-        self.failures.pop(provider, None)
-        self.open_until.pop(provider, None)
-
-    def record_failure(self, provider: str) -> None:
-        count = self.failures.get(provider, 0) + 1
-        self.failures[provider] = count
-        if count >= self.threshold:
-            self.open_until[provider] = time.monotonic() + self.cooldown_seconds
-
-
 class ProviderRuntime:
     """Own configured providers, routes, system message, and lifecycle callback."""
 
@@ -73,7 +44,6 @@ class ProviderRuntime:
         self.providers = providers
         self.routes = routes
         self.on_event = on_event
-        self.circuit_breaker = ProviderCircuitBreaker()
 
     def prepare_messages(
         self, messages: Iterable[Message | Mapping[str, Any]]

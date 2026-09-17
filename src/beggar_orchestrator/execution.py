@@ -155,8 +155,6 @@ class AgentExecution:
                     break
                 if time.monotonic() >= deadline:
                     break
-                if not runtime.circuit_breaker.allows(target.provider):
-                    continue
 
                 provider = runtime.providers.get(target.provider)
                 if provider is None:
@@ -223,7 +221,6 @@ class AgentExecution:
                     )
                     attempt_error.__cause__ = exc
                 else:
-                    runtime.circuit_breaker.record_success(target.provider)
                     self._response = final_response
                     await self.transition_to(
                         AgentStatus.RUN_COMPLETED,
@@ -239,8 +236,6 @@ class AgentExecution:
                     return
 
                 self._errors.append((target.provider, attempt_error))
-                if attempt_error.retryable:
-                    runtime.circuit_breaker.record_failure(target.provider)
                 if emitted_content:
                     await self.transition_to(AgentStatus.OUT_OF_USAGE)
                     raise attempt_error

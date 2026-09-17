@@ -1,6 +1,6 @@
 # LLM API integration status
 
-Last reviewed: 2026-09-15
+Last reviewed: 2026-09-16
 
 This is the source of truth for upstream provider onboarding. A built-in preset is not considered usable until authentication and a real model request have both passed with the intended account.
 
@@ -18,12 +18,13 @@ This is the source of truth for upstream provider onboarding. A built-in preset 
 | Order | Provider | Type | Default model | Authentication | Auth | Smoke | Route | Notes |
 |---:|---|---|---|---|---|---|---|---|
 | 1 | Groq | `groq` | `openai/gpt-oss-120b` | Bearer API key | passed | passed | passed | Plain and strict JSON Schema requests passed; reasoning models need at least a 128-token output budget for short answers |
-| 2 | OpenRouter | `openrouter` | `dots-studio/dots-3-note-preview:free` | Bearer API key | passed | passed | passed | Fixed zero-cost Dots3 model; 512K context and strict JSON Schema passed; preview endpoint is scheduled to end on 2026-09-30 |
+| 2 | OpenRouter | `openrouter` | `openrouter/free` | Bearer API key | passed | passed | model-dependent | Dynamic free-model router; the selected model and structured-output behavior may vary between requests |
 | 3 | Cohere | `cohere` | `command-a-plus-05-2026` | Bearer API key | passed | passed | plain-only | Free Trial key; plain completion works, but the current compatibility response was not directly parseable as required JSON |
 
-Groq and OpenRouter Dots3 are route-ready for structured log analysis. Cohere is enabled only
-in the local `general-chat` plain-text fallback group. Dots3 is temporary and must be replaced by
-2026-09-30. Provider implementations that have not completed a real model request are not retained.
+Groq remains the stable structured-output target. OpenRouter uses its dynamic free-model router,
+so structured-output support depends on the model selected for that request. Cohere is enabled only
+in the local `general-chat` plain-text fallback group. Provider implementations that have not
+completed a real model request are not retained.
 
 ## Removed providers
 
@@ -36,9 +37,11 @@ in the local `general-chat` plain-text fallback group. Dots3 is temporary and mu
 | Cloudflare Workers AI | Not tested with a credential and Account ID | Removed because it never reached the acceptance threshold |
 | Tencent TokenHub | Not tested with a credential | Removed because it never reached the acceptance threshold |
 | Alibaba Model Studio Singapore | Not tested with a credential and Workspace ID | Removed because it never reached the acceptance threshold |
+| NVIDIA hosted NIM | Authentication and `/v1/models` passed; `moonshotai/kimi-k3` timed out at 30, 60 and 120 seconds, while `meta/llama-3.3-70b-instruct` was deprecated | Tested, but no usable hosted completion was available; implementation, configuration and local credentials were removed |
+| ModelScope International | `/v1/models` returned 34 models, but completion returned HTTP 401 requiring an Alibaba Cloud account binding | Tested, but the account was not inference-ready; no implementation was added and the local credential was removed |
 
-Credentials for the three failed live tests were removed from the local plaintext fallback. No
-credential existed in the operating-system Keychain for any removed provider at cleanup time.
+Credentials for removed providers were removed from the local plaintext fallback. No credential
+existed in the operating-system Keychain for ModelScope at cleanup time.
 
 ## New free-tier candidates
 
@@ -53,8 +56,9 @@ completion both pass.
 | 4 | Hugging Face Inference Providers | Free users receive US$0.10 monthly routed-inference credit | OpenAI-compatible `https://router.huggingface.co/v1` | Select a live low-cost chat model from `/v1/models` |
 
 GitHub Models is deliberately excluded: GitHub retired its playground, catalog and inference API
-on 2026-07-30. NVIDIA hosted NIM was also excluded because its current official documentation
-describes trying hosted endpoints but does not state a dependable free hosted quota.
+on 2026-07-30. NVIDIA labels the hosted `moonshotai/kimi-k3` prototype as a Free Endpoint, but
+three authenticated completion attempts produced no response headers before their deadlines;
+the provider was removed after failing the acceptance test.
 
 ## Per-provider acceptance test
 
@@ -100,6 +104,13 @@ Add one row for every live attempt, including failures. Do not overwrite earlier
 | 2026-09-15 | Groq | `openai/gpt-oss-120b` | SSE completion | passed; content delta and final usage received | under 2 s concurrent probe | 152 total | finish reason `stop` |
 | 2026-09-15 | OpenRouter | `dots-studio/dots-3-note-preview:free` | SSE completion | passed; content delta and final usage received | under 2 s concurrent probe | 46 total | finish reason `stop` |
 | 2026-09-15 | Cohere | `command-a-plus-05-2026` | SSE completion with usage option | passed; content delta and final usage received | under 2 s concurrent probe | 89 total | compatibility endpoint |
+| 2026-09-16 | NVIDIA hosted NIM | `moonshotai/kimi-k3` | Minimal SSE completion | blocked; no response headers before the 30-second read timeout | 30 s | none | no request ID received |
+| 2026-09-16 | NVIDIA hosted NIM | `moonshotai/kimi-k3` | Minimal SSE retry | blocked; no response headers before the 60-second read timeout | 60 s | none | no request ID received |
+| 2026-09-16 | NVIDIA hosted NIM | `/v1/models` with replacement credential | Authentication and model discovery | passed; 81 model IDs returned and Kimi K3 was listed | under 1 s | none | HTTP 200 |
+| 2026-09-16 | NVIDIA hosted NIM | `moonshotai/kimi-k3` | Minimal SSE with replacement credential and prototype headers | blocked; no response headers before the 120-second read timeout | 120 s | none | no request ID received |
+| 2026-09-16 | NVIDIA hosted NIM | `meta/llama-3.3-70b-instruct` | Availability check | unavailable on hosted endpoint; absent from `/v1/models` and officially deprecated | under 1 s | none | use partner endpoint or self-hosted NIM |
+| 2026-09-16 | ModelScope International | `Qwen/Qwen3.5-35B-A3B` | Minimal completion | blocked; HTTP 401 requires binding an Alibaba Cloud account | under 1 s | none | credential removed after test |
+| 2026-09-16 | OpenRouter | `openrouter/free` | Package SSE verification after default change | passed through `nvidia/nemotron-3-ultra-550b-a55b:free` | 1,324 ms | 61 total | request ID present |
 
 ## Provider references
 
@@ -119,3 +130,4 @@ Add one row for every live attempt, including failures. Do not overwrite earlier
 - SambaNova free-tier limits: <https://docs.sambanova.ai/docs/en/models/rate-limits>
 - Hugging Face Inference Providers pricing: <https://huggingface.co/docs/inference-providers/pricing>
 - GitHub Models retirement: <https://docs.github.com/en/github-models>
+- NVIDIA Kimi K3 hosted NIM: <https://build.nvidia.com/moonshotai/kimi-k3>

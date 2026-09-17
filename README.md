@@ -9,6 +9,24 @@ Provider 實作；細節見 [Architecture](docs/architecture.md)。
 
 ## 安裝
 
+本機已建立 wheelhouse：
+
+```text
+/Users/lwaz/Documents/python-packages/
+```
+
+新專案若使用自己的 virtual environment，在該環境安裝 wheel 與 Keychain 支援：
+
+```bash
+python -m pip install \
+  '/Users/lwaz/Documents/python-packages/beggar_orchestrator-0.1.2-py3-none-any.whl[auth]'
+```
+
+虛擬環境之間彼此隔離，因此每個新專案的 `.venv` 都需要執行一次安裝。同一個 macOS
+使用者不需要重新儲存 API key，安裝後會共用現有 Keychain credential。
+
+開發本套件時才使用 editable install：
+
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
@@ -80,10 +98,9 @@ Message -> Agent -> AgentExecution -> LLMProvider -> StreamEvent -> Response
 | --- | --- | --- | --- |
 | `AgentExecution` | 執行一次不可重用的請求；選擇 Route target、控制 timeout/fallback/cancel、消費 Provider SSE、累積 partial output 並保留結果 | 由 `Agent` 擁有，透過 `ProviderRuntime` 找 Provider，並將所有狀態改變送給 `AgentStateMachine` | [`execution.py`](src/beggar_orchestrator/execution.py#L24) |
 | `AgentStateMachine` | 集中定義合法狀態轉移，拒絕非法轉移，並記錄完整歷史 | 只管狀態規則；不呼叫 API、不處理 SSE | [`lifecycle.py`](src/beggar_orchestrator/lifecycle.py#L83) |
-| `ProviderRuntime` | 保有這次 Agent 可用的 Providers、Routes、system instruction、circuit breaker 與 lifecycle callback | 由 configuration builder 建立，供 `AgentExecution` 查詢 | [`runtime.py`](src/beggar_orchestrator/runtime.py#L57) |
+| `ProviderRuntime` | 保有這次 Agent 可用的 Providers、Routes、system instruction 與 lifecycle callback | 由 configuration builder 建立，供 `AgentExecution` 查詢 | [`runtime.py`](src/beggar_orchestrator/runtime.py#L30) |
 | `Route` | 定義一組有順序的 Provider targets、最多嘗試次數與整體 deadline | 被 `AgentExecution` 用來決定下一個嘗試對象 | [`runtime.py`](src/beggar_orchestrator/runtime.py#L25) |
 | `RouteTarget` | 定義 Route 中一個候選 Provider、model override、priority 與單次 timeout | 不包含 API key，不自己發出請求 | [`runtime.py`](src/beggar_orchestrator/runtime.py#L16) |
-| `ProviderCircuitBreaker` | 計算 Provider 的連續可重試失敗；達門檻後在 cooldown 期間暫時跳過該 Provider | 由 `ProviderRuntime` 持有，成功時清除失敗計數 | [`runtime.py`](src/beggar_orchestrator/runtime.py#L31) |
 | `Settings` | 保存 TOML 解析後的 Provider 與 Route 原始設定，並作為 process 內 cache 的值 | 不含已建立的 Provider client，不發出網路請求 | [`config.py`](src/beggar_orchestrator/config.py#L21) |
 | `LLMProvider` | 將統一 messages 轉為 OpenAI-compatible HTTP request、解析 SSE、正規化錯誤、產生 `StreamEvent` 與 `Response` | 不決定 fallback、不管 Agent 生命週期 | [`providers/base.py`](src/beggar_orchestrator/providers/base.py#L64) |
 | `GroqProvider` / `OpenRouterProvider` / `CohereProvider` | 只定義平台特有的 endpoint、預設模型、headers 或 structured-output 格式 | 共用 HTTP/SSE 邏輯由 `LLMProvider` 處理 | [`providers/`](src/beggar_orchestrator/providers) |
@@ -99,7 +116,7 @@ Message -> Agent -> AgentExecution -> LLMProvider -> StreamEvent -> Response
 | `AllProvidersFailed` | Route 內所有可嘗試 Provider 都未完成請求；`errors` 保留各次失敗 |
 | `ProviderError` | Provider 層的基礎錯誤；`retryable` 告訴路由層是否應記錄為可重試失敗 |
 | `AuthenticationError` | API key 遺失、無效或被 Provider 拒絕；不可重試 |
-| `RateLimitError` | Provider 回傳 HTTP 429；可重試，可觸發 circuit breaker |
+| `RateLimitError` | Provider 回傳 HTTP 429；可由路由繼續嘗試下一個 target |
 | `ConfigError` | TOML、credential reference、Keychain dependency 或 Provider type 設定錯誤 |
 
 ## 啟動對話

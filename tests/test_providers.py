@@ -18,7 +18,7 @@ class ProviderTests(unittest.TestCase):
         self.assertEqual(GroqProvider(token=None).model, "openai/gpt-oss-120b")
         self.assertEqual(
             OpenRouterProvider(token=None).model,
-            "dots-studio/dots-3-note-preview:free",
+            "openrouter/free",
         )
         self.assertEqual(CohereProvider(token=None).model, "command-a-plus-05-2026")
 
