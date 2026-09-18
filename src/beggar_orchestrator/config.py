@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import getpass
+import logging
 import os
 import sys
 import tomllib
@@ -11,8 +12,11 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
-from .providers import PROVIDER_TYPES
+from .providers import CLIProvider, PROVIDER_TYPES
 from .runtime import EventHandler, ProviderRuntime, Route, RouteTarget
+
+
+logger = logging.getLogger(__name__)
 
 
 class ConfigError(RuntimeError):
@@ -34,6 +38,12 @@ def _load_config_file(absolute_path: str) -> Settings:
     routes = payload.get("routes") or {}
     if not routes:
         raise ConfigError("Configuration has no routes")
+    logger.info(
+        "orchestrator_config_loaded path=%s providers=%s routes=%s",
+        absolute_path,
+        sorted(providers),
+        sorted(routes),
+    )
     return Settings(providers=providers, routes=routes)
 
 
@@ -84,27 +94,70 @@ def _build_runtime(
     providers = {}
     for name, values in settings.providers.items():
         if not values.get("enabled", True):
+            logger.info("orchestrator_provider_disabled provider=%s", name)
             continue
         provider_type = values.get("type", name)
         provider_class = PROVIDER_TYPES.get(provider_type)
         if provider_class is None:
             raise ConfigError(f"Unsupported provider type {provider_type!r}")
-        reference = values.get("credential", f"keyring:{name}")
-        providers[name] = provider_class(
-            name=name,
-            token=read_token(reference),
-            model=values.get("model"),
+        reference = values.get("credential")
+        if reference is None and provider_class.requires_credential:
+            reference = f"keyring:{name}"
+        token = read_token(reference) if reference is not None else None
+        try:
+            providers[name] = provider_class.from_config(
+                name=name,
+                values=values,
+                token=token,
+            )
+        except (TypeError, ValueError) as exc:
+            logger.error(
+                "orchestrator_provider_config_invalid provider=%s type=%s error_type=%s "
+                "error=%s",
+                name,
+                provider_type,
+                type(exc).__name__,
+                str(exc).replace("\n", " ")[:300],
+            )
+            raise ConfigError(f"Invalid configuration for provider {name!r}: {exc}") from exc
+        logger.info(
+            "orchestrator_provider_configured provider=%s type=%s transport=%s model=%s "
+            "credential_configured=%s",
+            name,
+            provider_type,
+            "cli" if isinstance(providers[name], CLIProvider) else "http",
+            providers[name].model,
+            bool(token),
         )
 
     routes = {}
     for name, values in settings.routes.items():
-        targets = [RouteTarget(**target) for target in values.get("targets", [])]
+        if "max_attempts" in values:
+            raise ConfigError(
+                f"Route {name!r} cannot define max_attempts; every Agent call now "
+                "selects exactly one provider"
+            )
+        raw_targets = values.get("targets", [])
+        if any("priority" in target for target in raw_targets):
+            raise ConfigError(
+                f"Route {name!r} cannot define target priority; providers are selected "
+                "explicitly by the caller"
+            )
+        targets = [RouteTarget(**target) for target in raw_targets]
         if not targets:
             raise ConfigError(f"Route {name!r} has no targets")
+        provider_names = [target.provider for target in targets]
+        if len(provider_names) != len(set(provider_names)):
+            raise ConfigError(f"Route {name!r} contains duplicate provider targets")
         routes[name] = Route(
             targets=targets,
-            max_attempts=int(values.get("max_attempts", 3)),
             deadline_seconds=float(values.get("deadline_seconds", 60)),
+        )
+        logger.info(
+            "orchestrator_route_configured route=%s providers=%s deadline_seconds=%s",
+            name,
+            provider_names,
+            routes[name].deadline_seconds,
         )
     return ProviderRuntime(
         system=system,

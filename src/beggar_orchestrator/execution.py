@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 import uuid
 from collections.abc import AsyncIterator, Iterable, Mapping
@@ -13,12 +14,14 @@ from .lifecycle import (
     AgentSnapshot,
     AgentStateMachine,
     AgentStatus,
-    AllProvidersFailed,
     TERMINAL_AGENT_STATUSES,
 )
 from .messages import Message
 from .providers import ProviderError, Response, StreamEvent, StreamEventType
 from .runtime import ProviderRuntime
+
+
+logger = logging.getLogger(__name__)
 
 
 class AgentExecution:
@@ -28,6 +31,7 @@ class AgentExecution:
         self._runtime: ProviderRuntime | None = runtime
         self.agent_id = agent_id or str(uuid.uuid4())
         self.route = ""
+        self.requested_provider = ""
         self.temperature: float | None = None
         self.max_output_tokens: int | None = None
         self.response_schema: dict[str, Any] | None = None
@@ -107,6 +111,7 @@ class AgentExecution:
         self,
         *,
         route: str,
+        provider: str,
         messages: Iterable[Message | Mapping[str, Any]],
         temperature: float | None,
         max_output_tokens: int | None,
@@ -119,6 +124,9 @@ class AgentExecution:
                 f"Agent {self.agent_id!r} has already been configured"
             )
         self.route = route
+        if not isinstance(provider, str) or not provider.strip():
+            raise AgentError("Agent requires an explicit provider")
+        self.requested_provider = provider.strip()
         self._messages = list(messages)
         self.temperature = temperature
         self.max_output_tokens = max_output_tokens
@@ -126,6 +134,16 @@ class AgentExecution:
         if request_id is not None:
             self.agent_id = request_id
         self._request_configured = True
+        logger.info(
+            "agent_request_configured agent_id=%s route=%s provider=%s message_count=%s "
+            "structured=%s max_output_tokens=%s",
+            self.agent_id,
+            self.route,
+            self.requested_provider,
+            len(self._messages),
+            response_schema is not None,
+            max_output_tokens,
+        )
 
     async def start(self) -> Response:
         response: Response | None = None
@@ -139,115 +157,226 @@ class AgentExecution:
     async def stream(self) -> AsyncIterator[StreamEvent]:
         self._claim_start()
         self._running_task = asyncio.current_task()
-        runtime = self._require_runtime()
-        route_policy = runtime.routes.get(self.route)
-        if route_policy is None:
-            await self.transition_to(AgentStatus.OUT_OF_USAGE)
-            raise AgentError(f"Unknown route {self.route!r}")
-
-        prepared_messages = runtime.prepare_messages(self._messages)
-        deadline = time.monotonic() + route_policy.deadline_seconds
-        timed_out_attempts = 0
-
         try:
-            for target in sorted(route_policy.targets, key=lambda item: item.priority):
-                if self._attempt >= route_policy.max_attempts:
-                    break
-                if time.monotonic() >= deadline:
-                    break
-
-                provider = runtime.providers.get(target.provider)
-                if provider is None:
-                    self._errors.append(
-                        (target.provider, AgentError("Provider is not configured"))
-                    )
-                    continue
-
-                selected_model = target.model or provider.model
-                await self.transition_to(
-                    AgentStatus.ATTEMPT_STARTED,
-                    provider=target.provider,
-                    model=selected_model,
-                    attempt=self._attempt + 1,
+            runtime = self._require_runtime()
+            route_policy = runtime.routes.get(self.route)
+            if route_policy is None:
+                logger.error(
+                    "agent_route_missing agent_id=%s route=%s configured_routes=%s",
+                    self.agent_id,
+                    self.route,
+                    sorted(runtime.routes),
                 )
-                emitted_content = False
-                attempt_timeout = min(
-                    target.timeout_seconds,
-                    max(0.001, deadline - time.monotonic()),
-                )
-
-                try:
-                    final_response: Response | None = None
-                    async with asyncio.timeout(attempt_timeout):
-                        async for event in provider.stream(
-                            messages=prepared_messages,
-                            model=target.model,
-                            temperature=self.temperature,
-                            max_output_tokens=self.max_output_tokens,
-                            response_schema=self.response_schema,
-                            timeout=attempt_timeout,
-                        ):
-                            if event.type is StreamEventType.CONNECTED:
-                                await self.transition_to(
-                                    AgentStatus.CONNECTED,
-                                    provider=event.provider,
-                                    model=event.model,
-                                )
-                                yield event
-                            elif event.type is StreamEventType.CONTENT_DELTA:
-                                emitted_content = True
-                                self._content_parts.append(event.content)
-                                yield event
-                            else:
-                                final_response = event.response
-                    if final_response is None:
-                        raise ProviderError(
-                            "Provider stream ended without a result", retryable=True
-                        )
-                except TimeoutError as exc:
-                    timed_out_attempts += 1
-                    attempt_error = ProviderError(
-                        "Agent attempt timed out", retryable=True
-                    )
-                    attempt_error.__cause__ = exc
-                except ProviderError as exc:
-                    attempt_error = exc
-                except asyncio.CancelledError:
-                    await self._mark_cancelled()
-                    return
-                except Exception as exc:
-                    attempt_error = ProviderError(
-                        "Unexpected provider failure", retryable=False
-                    )
-                    attempt_error.__cause__ = exc
-                else:
-                    self._response = final_response
-                    await self.transition_to(
-                        AgentStatus.RUN_COMPLETED,
-                        provider=final_response.provider,
-                        model=final_response.model,
-                    )
-                    yield StreamEvent(
-                        StreamEventType.COMPLETED,
-                        target.provider,
-                        final_response.model,
-                        response=final_response,
-                    )
-                    return
-
-                self._errors.append((target.provider, attempt_error))
-                if emitted_content:
-                    await self.transition_to(AgentStatus.OUT_OF_USAGE)
-                    raise attempt_error
-
-            all_failures_were_timeouts = bool(self._errors) and (
-                timed_out_attempts == len(self._errors)
-            )
-            if time.monotonic() >= deadline or all_failures_were_timeouts:
-                await self.transition_to(AgentStatus.RUN_TIMED_OUT)
-            else:
                 await self.transition_to(AgentStatus.OUT_OF_USAGE)
-            raise AllProvidersFailed(self.route, self._errors)
+                raise AgentError(f"Unknown route {self.route!r}")
+
+            target = route_policy.target_for(self.requested_provider)
+            if target is None:
+                error = AgentError(
+                    f"Provider {self.requested_provider!r} is not allowed for route "
+                    f"{self.route!r}"
+                )
+                self._errors.append((self.requested_provider, error))
+                logger.error(
+                    "agent_provider_not_allowed agent_id=%s route=%s provider=%s "
+                    "allowed_providers=%s",
+                    self.agent_id,
+                    self.route,
+                    self.requested_provider,
+                    [item.provider for item in route_policy.targets],
+                )
+                await self.transition_to(
+                    AgentStatus.OUT_OF_USAGE,
+                    provider=self.requested_provider,
+                )
+                raise error
+
+            provider = runtime.providers.get(self.requested_provider)
+            if provider is None:
+                error = AgentError(
+                    f"Provider {self.requested_provider!r} is not configured or is disabled"
+                )
+                self._errors.append((self.requested_provider, error))
+                logger.error(
+                    "agent_provider_missing agent_id=%s route=%s provider=%s",
+                    self.agent_id,
+                    self.route,
+                    self.requested_provider,
+                )
+                await self.transition_to(
+                    AgentStatus.OUT_OF_USAGE,
+                    provider=self.requested_provider,
+                )
+                raise error
+
+            prepared_messages = runtime.prepare_messages(self._messages)
+            deadline = time.monotonic() + route_policy.deadline_seconds
+            selected_model = target.model or provider.model
+            logger.info(
+                "agent_run_started agent_id=%s route=%s provider=%s model=%s "
+                "deadline_seconds=%s structured=%s",
+                self.agent_id,
+                self.route,
+                self.requested_provider,
+                selected_model,
+                route_policy.deadline_seconds,
+                self.response_schema is not None,
+            )
+
+            await self.transition_to(
+                AgentStatus.ATTEMPT_STARTED,
+                provider=self.requested_provider,
+                model=selected_model,
+                attempt=1,
+            )
+            attempt_timeout = min(
+                target.timeout_seconds,
+                max(0.001, deadline - time.monotonic()),
+            )
+            attempt_started = time.monotonic()
+            emitted_content = False
+            logger.info(
+                "agent_attempt_started agent_id=%s route=%s attempt=1 provider=%s "
+                "model=%s timeout_seconds=%.3f deadline_remaining_seconds=%.3f",
+                self.agent_id,
+                self.route,
+                self.requested_provider,
+                selected_model,
+                attempt_timeout,
+                max(0.0, deadline - time.monotonic()),
+            )
+
+            timed_out = False
+            try:
+                final_response: Response | None = None
+                async with asyncio.timeout(attempt_timeout):
+                    async for event in provider.stream(
+                        messages=prepared_messages,
+                        model=target.model,
+                        temperature=self.temperature,
+                        max_output_tokens=self.max_output_tokens,
+                        response_schema=self.response_schema,
+                        timeout=attempt_timeout,
+                    ):
+                        if event.type is StreamEventType.CONNECTED:
+                            logger.info(
+                                "agent_attempt_connected agent_id=%s route=%s attempt=1 "
+                                "provider=%s model=%s connect_ms=%s",
+                                self.agent_id,
+                                self.route,
+                                event.provider,
+                                event.model,
+                                int((time.monotonic() - attempt_started) * 1000),
+                            )
+                            await self.transition_to(
+                                AgentStatus.CONNECTED,
+                                provider=event.provider,
+                                model=event.model,
+                            )
+                            yield event
+                        elif event.type is StreamEventType.CONTENT_DELTA:
+                            emitted_content = True
+                            self._content_parts.append(event.content)
+                            yield event
+                        else:
+                            final_response = event.response
+                if final_response is None:
+                    raise ProviderError(
+                        "Provider stream ended without a result", retryable=True
+                    )
+            except TimeoutError as exc:
+                timed_out = True
+                attempt_error = ProviderError("Agent attempt timed out", retryable=True)
+                attempt_error.__cause__ = exc
+            except ProviderError as exc:
+                attempt_error = exc
+            except asyncio.CancelledError:
+                logger.info(
+                    "agent_attempt_cancelled agent_id=%s route=%s attempt=1 provider=%s "
+                    "model=%s duration_ms=%s",
+                    self.agent_id,
+                    self.route,
+                    self.requested_provider,
+                    selected_model,
+                    int((time.monotonic() - attempt_started) * 1000),
+                )
+                raise
+            except Exception as exc:
+                attempt_error = ProviderError(
+                    "Unexpected provider failure", retryable=False
+                )
+                attempt_error.__cause__ = exc
+            else:
+                self._response = final_response
+                logger.info(
+                    "agent_attempt_succeeded agent_id=%s route=%s attempt=1 provider=%s "
+                    "model=%s duration_ms=%s request_id=%s response_chars=%s "
+                    "input_tokens=%s output_tokens=%s total_tokens=%s finish_reason=%s",
+                    self.agent_id,
+                    self.route,
+                    final_response.provider,
+                    final_response.model,
+                    int((time.monotonic() - attempt_started) * 1000),
+                    final_response.request_id,
+                    len(final_response.content),
+                    final_response.usage.input_tokens,
+                    final_response.usage.output_tokens,
+                    final_response.usage.total_tokens,
+                    final_response.finish_reason,
+                )
+                await self.transition_to(
+                    AgentStatus.RUN_COMPLETED,
+                    provider=final_response.provider,
+                    model=final_response.model,
+                )
+                yield StreamEvent(
+                    StreamEventType.COMPLETED,
+                    self.requested_provider,
+                    final_response.model,
+                    response=final_response,
+                )
+                return
+
+            self._errors.append((self.requested_provider, attempt_error))
+            logger.warning(
+                "agent_attempt_failed agent_id=%s route=%s attempt=1 provider=%s "
+                "model=%s duration_ms=%s emitted_content=%s retryable=%s "
+                "status_code=%s provider_code=%s request_id=%s retry_after=%s "
+                "limit_source=%s upstream_provider=%s remedy_hint=%s error_type=%s "
+                "error=%s cause_type=%s",
+                self.agent_id,
+                self.route,
+                self.requested_provider,
+                selected_model,
+                int((time.monotonic() - attempt_started) * 1000),
+                emitted_content,
+                attempt_error.retryable,
+                attempt_error.status_code,
+                getattr(attempt_error, "provider_code", None),
+                getattr(attempt_error, "request_id", None),
+                getattr(attempt_error, "retry_after", None),
+                getattr(attempt_error, "limit_source", None),
+                getattr(attempt_error, "upstream_provider", None),
+                getattr(attempt_error, "remedy_hint", None),
+                type(attempt_error).__name__,
+                str(attempt_error).replace("\n", " ")[:300],
+                type(attempt_error.__cause__).__name__
+                if attempt_error.__cause__ is not None
+                else None,
+            )
+            await self.transition_to(
+                AgentStatus.RUN_TIMED_OUT if timed_out else AgentStatus.OUT_OF_USAGE
+            )
+            logger.error(
+                "agent_run_failed agent_id=%s route=%s provider=%s status=%s "
+                "attempts=1 error_type=%s",
+                self.agent_id,
+                self.route,
+                self.requested_provider,
+                self._state.status,
+                type(attempt_error).__name__,
+            )
+            raise attempt_error
         except asyncio.CancelledError:
             await self._mark_cancelled()
             return
@@ -259,6 +388,13 @@ class AgentExecution:
         if self._state.is_terminal:
             return
         self._cancel_reason = reason
+        logger.info(
+            "agent_cancel_requested agent_id=%s route=%s status=%s reason=%s",
+            self.agent_id,
+            self.route,
+            self._state.status,
+            reason.replace("\n", " ")[:200],
+        )
         if not self._started:
             self._started = True
             await self.transition_to(AgentStatus.RUN_CANCELLED)
@@ -283,6 +419,7 @@ class AgentExecution:
         self._running_task = None
         self._runtime = None
         self._cleared = True
+        logger.info("agent_cleared agent_id=%s route=%s", self.agent_id, self.route)
 
     def register_active_stream(self, stream: AsyncIterator[StreamEvent]) -> None:
         self._active_stream = stream
@@ -326,6 +463,21 @@ class AgentExecution:
             self._connected_at = transition.occurred_at
         if status in TERMINAL_AGENT_STATUSES:
             self._ended_at = transition.occurred_at
+
+        logger.info(
+            "agent_state_changed agent_id=%s route=%s previous=%s current=%s "
+            "provider=%s model=%s attempt=%s elapsed_ms=%s",
+            self.agent_id,
+            self.route,
+            transition.previous,
+            transition.current,
+            self._provider,
+            self._model,
+            self._attempt,
+            0
+            if self._started_at is None
+            else int((transition.occurred_at - self._started_at) * 1000),
+        )
 
         runtime = self._runtime
         if runtime is not None:

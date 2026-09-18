@@ -1,11 +1,16 @@
 # beggar-orchestrator
 
-一個只負責 LLM API 呼叫、路由、SSE 與生命週期的 Python 套件。目前已實測 Groq、
-OpenRouter、Cohere。
+一個只負責 LLM 呼叫、路由、串流與生命週期的 Python 套件。Provider 可以由 HTTP API
+或本機 CLI 實作；目前已實測 Groq、OpenRouter、Cohere 與 Antigravity `agy`。
 
 公開呼叫端只有一個 `Agent`。每個 Agent 只能執行一次；下一次對話請建立新的 Agent。
 內部模組已按單一職責分為公開介面、單次執行、生命週期、訊息處理、路由執行環境與
 Provider 實作；細節見 [Architecture](docs/architecture.md)。
+
+執行期間會以結構化 `key=value` log 記錄 route、provider、model、attempt、狀態轉換、
+HTTP/CLI 結果、request ID、延遲、token usage 與失敗原因。套件不設定 root logger，
+會沿用 FastAPI 應用程式的 logging 設定；完整事件與排查方式見
+[Observability](docs/observability.md)。
 
 ## 安裝
 
@@ -19,7 +24,7 @@ Provider 實作；細節見 [Architecture](docs/architecture.md)。
 
 ```bash
 python -m pip install \
-  '/Users/lwaz/Documents/python-packages/beggar_orchestrator-0.1.2-py3-none-any.whl[auth]'
+  '/Users/lwaz/Documents/python-packages/beggar_orchestrator-0.3.0-py3-none-any.whl[auth]'
 ```
 
 虛擬環境之間彼此隔離，因此每個新專案的 `.venv` 都需要執行一次安裝。同一個 macOS
@@ -67,7 +72,9 @@ beggar-auth verify groq --config providers.toml
 ```text
 providers.toml -> Settings -> ProviderRuntime
                                   |
-Message -> Agent -> AgentExecution -> LLMProvider -> StreamEvent -> Response
+Message -> Agent -> AgentExecution -> Provider -> StreamEvent -> Response
+                                        |-- LLMProvider (HTTP API)
+                                        +-- CLIProvider (local process)
                 |                       |
                 +-> AgentStateMachine <-+
                          |
@@ -96,14 +103,16 @@ Message -> Agent -> AgentExecution -> LLMProvider -> StreamEvent -> Response
 
 | 物件 | 單一職責 | 與其他物件的關係 | 原始碼 |
 | --- | --- | --- | --- |
-| `AgentExecution` | 執行一次不可重用的請求；選擇 Route target、控制 timeout/fallback/cancel、消費 Provider SSE、累積 partial output 並保留結果 | 由 `Agent` 擁有，透過 `ProviderRuntime` 找 Provider，並將所有狀態改變送給 `AgentStateMachine` | [`execution.py`](src/beggar_orchestrator/execution.py#L24) |
+| `AgentExecution` | 執行一次不可重用的請求；使用呼叫端指定的單一 Provider、控制 timeout/cancel、消費 Provider SSE、累積 partial output並保留結果 | 由 `Agent` 擁有，透過 `ProviderRuntime` 找 Provider，並將所有狀態改變送給 `AgentStateMachine` | [`execution.py`](src/beggar_orchestrator/execution.py#L24) |
 | `AgentStateMachine` | 集中定義合法狀態轉移，拒絕非法轉移，並記錄完整歷史 | 只管狀態規則；不呼叫 API、不處理 SSE | [`lifecycle.py`](src/beggar_orchestrator/lifecycle.py#L83) |
 | `ProviderRuntime` | 保有這次 Agent 可用的 Providers、Routes、system instruction 與 lifecycle callback | 由 configuration builder 建立，供 `AgentExecution` 查詢 | [`runtime.py`](src/beggar_orchestrator/runtime.py#L30) |
-| `Route` | 定義一組有順序的 Provider targets、最多嘗試次數與整體 deadline | 被 `AgentExecution` 用來決定下一個嘗試對象 | [`runtime.py`](src/beggar_orchestrator/runtime.py#L25) |
-| `RouteTarget` | 定義 Route 中一個候選 Provider、model override、priority 與單次 timeout | 不包含 API key，不自己發出請求 | [`runtime.py`](src/beggar_orchestrator/runtime.py#L16) |
+| `Route` | 定義某類工作允許使用的 Provider profiles 與整體 deadline | 不排序、不輪詢 Provider | [`runtime.py`](src/beggar_orchestrator/runtime.py#L23) |
+| `RouteTarget` | 定義一個允許的 Provider、model override 與單次 timeout | 不包含 API key，不具有 priority | [`runtime.py`](src/beggar_orchestrator/runtime.py#L16) |
 | `Settings` | 保存 TOML 解析後的 Provider 與 Route 原始設定，並作為 process 內 cache 的值 | 不含已建立的 Provider client，不發出網路請求 | [`config.py`](src/beggar_orchestrator/config.py#L21) |
-| `LLMProvider` | 將統一 messages 轉為 OpenAI-compatible HTTP request、解析 SSE、正規化錯誤、產生 `StreamEvent` 與 `Response` | 不決定 fallback、不管 Agent 生命週期 | [`providers/base.py`](src/beggar_orchestrator/providers/base.py#L64) |
-| `GroqProvider` / `OpenRouterProvider` / `CohereProvider` | 只定義平台特有的 endpoint、預設模型、headers 或 structured-output 格式 | 共用 HTTP/SSE 邏輯由 `LLMProvider` 處理 | [`providers/`](src/beggar_orchestrator/providers) |
+| `Provider` | API 與 CLI adapter 共同遵守的 transport-neutral protocol；統一 `stream()`、`verify()`、model 與事件格式 | 不規定 HTTP 或 subprocess | [`providers/base.py`](src/beggar_orchestrator/providers/base.py) |
+| `LLMProvider` | 將統一 messages 轉為 OpenAI-compatible HTTP request、解析 SSE、正規化錯誤 | 不選擇其他 Provider、不管 Agent 生命週期 | [`providers/base.py`](src/beggar_orchestrator/providers/base.py) |
+| `CLIProvider` | 安全啟動及停止本機 subprocess，並提供 CLI adapter 的共同生命週期 | 不解析特定 CLI 輸出 | [`providers/cli.py`](src/beggar_orchestrator/providers/cli.py) |
+| `AgyProvider` | 將 system/messages/schema 轉成 `agy` headless NDJSON，並將結果及 usage 正規化 | 不保存 agy conversation、不繞過權限 | [`providers/agy.py`](src/beggar_orchestrator/providers/agy.py) |
 
 ### 錯誤物件
 
@@ -113,10 +122,9 @@ Message -> Agent -> AgentExecution -> LLMProvider -> StreamEvent -> Response
 | `AgentAlreadyStartedError` | 同一個單次 Agent 被再次啟動、設定或進入 context |
 | `AgentClearedError` | `clear()` 之後繼續讀取或操作 Agent |
 | `InvalidAgentTransitionError` | 請求不在 `_allowed` 表中的生命週期轉移 |
-| `AllProvidersFailed` | Route 內所有可嘗試 Provider 都未完成請求；`errors` 保留各次失敗 |
-| `ProviderError` | Provider 層的基礎錯誤；`retryable` 告訴路由層是否應記錄為可重試失敗 |
+| `ProviderError` | 指定 Provider 呼叫失敗；`retryable` 僅提供診斷資訊，不會觸發切換 |
 | `AuthenticationError` | API key 遺失、無效或被 Provider 拒絕；不可重試 |
-| `RateLimitError` | Provider 回傳 HTTP 429；可由路由繼續嘗試下一個 target |
+| `RateLimitError` | 指定 Provider 回傳 HTTP 429；本次 Agent 立即失敗 |
 | `ConfigError` | TOML、credential reference、Keychain dependency 或 Provider type 設定錯誤 |
 
 ## 啟動對話
@@ -132,6 +140,7 @@ async def main():
 
     response = await agent.start(
         route="general-chat",
+        provider="groq",
         messages=[Message.user("用一句話說明目前服務狀態")],
         max_output_tokens=500,
     )
@@ -158,6 +167,7 @@ async def main():
     async with agent:
         async for event in agent.stream(
             route="general-chat",
+            provider="groq",
             messages=[Message.user("分析 production logs")],
         ):
             if event.type is StreamEventType.CONTENT_DELTA:
@@ -183,6 +193,7 @@ asyncio.run(main())
 async with agent:
     async for event in agent.stream(
         route="general-chat",
+        provider="groq",
         messages=[Message.user("產生一篇長文章")],
     ):
         if event.type is StreamEventType.CONTENT_DELTA:
@@ -229,7 +240,7 @@ for transition in snapshot.transitions:
 | `INIT_FAILED` | 設定載入失敗，或沒有任何可用 Provider | 是 | 無 | [`AgentExecution.__init__`](src/beggar_orchestrator/execution.py#L55) |
 | `ATTEMPT_STARTED` | 開始嘗試某個 Provider | 否 | `ATTEMPT_STARTED`、`CONNECTED`、`OUT_OF_USAGE`、`RUN_TIMED_OUT`、`RUN_CANCELLED` | [開始 Provider attempt](src/beggar_orchestrator/execution.py#L169) |
 | `CONNECTED` | 已連接 Provider，可能正在接收 SSE 內容 | 否 | `ATTEMPT_STARTED`、`OUT_OF_USAGE`、`RUN_COMPLETED`、`RUN_TIMED_OUT`、`RUN_CANCELLED` | [收到 `CONNECTED` event](src/beggar_orchestrator/execution.py#L192) |
-| `OUT_OF_USAGE` | Route 允許的 Provider 已全部嘗試失敗 | 是 | 無 | [未知 Route](src/beggar_orchestrator/execution.py#L145)、[已輸出後失敗](src/beggar_orchestrator/execution.py#L245)、[所有嘗試失敗](src/beggar_orchestrator/execution.py#L254) |
+| `OUT_OF_USAGE` | 指定 Provider 不存在、不被 Route 允許、額度不足或呼叫失敗 | 是 | 無 | [`AgentExecution.stream()`](src/beggar_orchestrator/execution.py) |
 | `RUN_COMPLETED` | 對話正常完成，結果可透過 `response` 或 `snapshot()` 讀取 | 是 | 無 | [Provider 完整回應](src/beggar_orchestrator/execution.py#L228) |
 | `RUN_TIMED_OUT` | 單次 Provider timeout 或整體 deadline 已到 | 是 | 無 | [timeout 結算](src/beggar_orchestrator/execution.py#L252) |
 | `RUN_CANCELLED` | 被外部取消、中途離開 context，或串流未讀完 | 是 | 無 | [取消尚未啟動的 Agent](src/beggar_orchestrator/execution.py#L269)、[取消執行中 Agent](src/beggar_orchestrator/execution.py#L370) |
@@ -245,8 +256,8 @@ for transition in snapshot.transitions:
 3. 合法時更新目前狀態，並將 `previous`、`current`、`occurred_at` 寫入歷史。
 4. `AgentExecution.transition_to()` 接著更新 Provider、model、attempt 與時間，再通知 `on_event` callback。
 
-`CONNECTED -> ATTEMPT_STARTED` 只會發生在尚未輸出任何內容、仍允許 fallback
-到下一個 Provider 時。一旦開始輸出內容，就不會切換 Provider，避免混合不同模型的回答。
+每個 Agent 只有一次 `ATTEMPT_STARTED`。Provider 失敗後直接進入終止狀態，不會再回到
+`ATTEMPT_STARTED`，因此不可能把不同模型的回答混在一起。
 
 同一個 Agent 第二次呼叫 `start()` 或 `stream()` 會拋出
 `AgentAlreadyStartedError`。終止後結果仍可讀；確認不再需要資料時呼叫：
@@ -258,11 +269,12 @@ await agent.clear()
 清除後 `agent.is_cleared` 為 `True`，再次讀取 status、response 或 snapshot 會拋出
 `AgentClearedError`。
 
-## 路由與 fallback
+## Route 與明確 Provider 選擇
 
-Route 依 `priority` 嘗試 Provider，並受 `max_attempts`、各 Provider timeout 與整體
-deadline 限制。只要尚未輸出內容，失敗便會嘗試下一家；開始輸出後不會 fallback，
-避免把兩個模型的回答混在一起。
+呼叫 `start()` 或 `stream()` 時必須傳入 `provider=`。Route 只保存每家 Provider 對這類
+工作的 model override、單次 timeout 與整體 deadline，不再包含 `priority` 或
+`max_attempts`。指定 Provider 不存在、不在 Route targets、回傳 429、timeout 或其他錯誤時，
+本次 Agent 立即失敗，不會呼叫另一家 Provider。
 
-`OUT_OF_USAGE` 表示 Route 允許的 Provider 嘗試已耗盡，不保證錯誤原因一定是 API
-額度不足。API Key 不得放入 TOML、Git、server log 或對話內容。
+`OUT_OF_USAGE` 是非 timeout Provider 失敗的既有終止狀態，不保證原因一定是 API 額度不足；
+應搭配 snapshot error 與結構化 log 判斷。API Key 不得放入 TOML、Git、server log 或對話內容。

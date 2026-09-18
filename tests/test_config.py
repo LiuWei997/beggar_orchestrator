@@ -6,7 +6,13 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from beggar_orchestrator.config import Settings, _build_runtime, load_config, read_token
+from beggar_orchestrator.config import (
+    ConfigError,
+    Settings,
+    _build_runtime,
+    load_config,
+    read_token,
+)
 
 
 class ConfigTests(unittest.TestCase):
@@ -32,9 +38,55 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(runtime.providers["primary"].model, "openai/gpt-oss-20b")
         self.assertEqual(runtime.routes["chat"].targets[0].provider, "primary")
 
+    def test_cli_provider_does_not_require_a_keyring_credential(self):
+        settings = Settings(
+            providers={
+                "local-agy": {
+                    "type": "agy",
+                    "model": "gemini-3.8-flash-low",
+                    "executable": "/custom/agy",
+                }
+            },
+            routes={"chat": {"targets": [{"provider": "local-agy"}]}},
+        )
+
+        runtime = _build_runtime(settings, system="system rules")
+
+        self.assertEqual(runtime.providers["local-agy"].executable, "/custom/agy")
+        self.assertEqual(runtime.providers["local-agy"].model, "gemini-3.8-flash-low")
+
     def test_environment_token_reference(self):
         with patch.dict(os.environ, {"TEST_TOKEN": "secret"}):
             self.assertEqual(read_token("env:TEST_TOKEN"), "secret")
+
+    def test_legacy_provider_polling_fields_are_rejected(self):
+        settings = Settings(
+            providers={"groq": {"type": "groq", "credential": "env:TEST_TOKEN"}},
+            routes={
+                "chat": {
+                    "max_attempts": 2,
+                    "targets": [{"provider": "groq", "priority": 10}],
+                }
+            },
+        )
+
+        with patch.dict(os.environ, {"TEST_TOKEN": "secret"}):
+            with self.assertRaisesRegex(ConfigError, "cannot define max_attempts"):
+                _build_runtime(settings, system="system rules")
+
+    def test_duplicate_provider_targets_are_rejected(self):
+        settings = Settings(
+            providers={"groq": {"type": "groq", "credential": "env:TEST_TOKEN"}},
+            routes={
+                "chat": {
+                    "targets": [{"provider": "groq"}, {"provider": "groq"}],
+                }
+            },
+        )
+
+        with patch.dict(os.environ, {"TEST_TOKEN": "secret"}):
+            with self.assertRaisesRegex(ConfigError, "duplicate provider"):
+                _build_runtime(settings, system="system rules")
 
     def test_config_file_is_cached_after_first_read(self):
         with tempfile.TemporaryDirectory() as directory:

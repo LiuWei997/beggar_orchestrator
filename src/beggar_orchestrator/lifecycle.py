@@ -11,14 +11,6 @@ class AgentError(RuntimeError):
     pass
 
 
-class AllProvidersFailed(AgentError):
-    def __init__(self, route: str, errors: list[tuple[str, Exception]]):
-        self.route = route
-        self.errors = errors
-        summary = "; ".join(f"{name}: {type(error).__name__}" for name, error in errors)
-        super().__init__(f"All providers failed for route {route!r}: {summary}")
-
-
 class AgentAlreadyStartedError(AgentError):
     pass
 
@@ -96,7 +88,6 @@ class AgentStateMachine:
         AgentStatus.INIT_FAILED: frozenset(),
         AgentStatus.ATTEMPT_STARTED: frozenset(
             {
-                AgentStatus.ATTEMPT_STARTED,
                 AgentStatus.CONNECTED,
                 AgentStatus.OUT_OF_USAGE,
                 AgentStatus.RUN_TIMED_OUT,
@@ -105,7 +96,6 @@ class AgentStateMachine:
         ),
         AgentStatus.CONNECTED: frozenset(
             {
-                AgentStatus.ATTEMPT_STARTED,
                 AgentStatus.OUT_OF_USAGE,
                 AgentStatus.RUN_COMPLETED,
                 AgentStatus.RUN_TIMED_OUT,

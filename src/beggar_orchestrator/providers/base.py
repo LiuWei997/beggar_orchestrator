@@ -1,28 +1,68 @@
 from __future__ import annotations
 
 import json
+import logging
+import re
 import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Any
+from typing import Any, Protocol, runtime_checkable
+
+
+logger = logging.getLogger(__name__)
+
+
+def _safe_log_text(value: Any, limit: int = 300) -> str:
+    """Keep useful provider diagnostics without logging credential-shaped data."""
+    text = " ".join(str(value or "").split())
+    text = re.sub(r"(?i)bearer\s+[A-Za-z0-9._~+/=-]+", "Bearer [REDACTED]", text)
+    text = re.sub(r"\bsk-[A-Za-z0-9_-]{8,}\b", "[REDACTED_KEY]", text)
+    text = re.sub(r"\bAIza[A-Za-z0-9_-]{20,}\b", "[REDACTED_KEY]", text)
+    text = re.sub(
+        r"(?i)(api[_-]?key|access[_-]?token|authorization)([\"'=:\s]+)"
+        r"[A-Za-z0-9._~+/=-]{8,}",
+        r"\1\2[REDACTED]",
+        text,
+    )
+    return text[:limit]
 
 
 class ProviderError(RuntimeError):
-    def __init__(self, message: str, *, retryable: bool, status_code: int | None = None):
+    def __init__(
+        self,
+        message: str,
+        *,
+        retryable: bool,
+        status_code: int | None = None,
+        provider_code: str | None = None,
+        provider_message: str | None = None,
+        request_id: str | None = None,
+        retry_after: str | None = None,
+        limit_source: str | None = None,
+        upstream_provider: str | None = None,
+        remedy_hint: str | None = None,
+    ):
         super().__init__(message)
         self.retryable = retryable
         self.status_code = status_code
+        self.provider_code = provider_code
+        self.provider_message = provider_message
+        self.request_id = request_id
+        self.retry_after = retry_after
+        self.limit_source = limit_source
+        self.upstream_provider = upstream_provider
+        self.remedy_hint = remedy_hint
 
 
 class AuthenticationError(ProviderError):
-    def __init__(self, message: str = "Provider authentication failed"):
-        super().__init__(message, retryable=False, status_code=401)
+    def __init__(self, message: str = "Provider authentication failed", **details: Any):
+        super().__init__(message, retryable=False, status_code=401, **details)
 
 
 class RateLimitError(ProviderError):
-    def __init__(self, message: str = "Provider rate limit exceeded"):
-        super().__init__(message, retryable=True, status_code=429)
+    def __init__(self, message: str = "Provider rate limit exceeded", **details: Any):
+        super().__init__(message, retryable=True, status_code=429, **details)
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,7 +98,32 @@ class StreamEvent:
     response: Response | None = None
 
 
+@runtime_checkable
+class Provider(Protocol):
+    """Transport-neutral contract implemented by API and CLI adapters."""
+
+    name: str
+    model: str
+
+    def stream(
+        self,
+        *,
+        messages: list[dict[str, Any]],
+        model: str | None = None,
+        temperature: float | None = None,
+        max_output_tokens: int | None = None,
+        response_schema: dict[str, Any] | None = None,
+        timeout: float = 30,
+    ) -> AsyncIterator[StreamEvent]: ...
+
+    async def verify(self, *, timeout: float = 20) -> Response: ...
+
+
 class LLMProvider:
+    """Base implementation for OpenAI-compatible HTTP API adapters."""
+
+    requires_credential = True
+
     def __init__(
         self,
         *,
@@ -75,6 +140,16 @@ class LLMProvider:
         self.model = model
         self.headers = dict(headers or {})
         self.schema_format = schema_format
+
+    @classmethod
+    def from_config(
+        cls,
+        *,
+        name: str,
+        values: dict[str, Any],
+        token: str | None,
+    ) -> LLMProvider:
+        return cls(name=name, token=token, model=values.get("model"))
 
     def _headers(self) -> dict[str, str]:
         if not self.token:
@@ -119,18 +194,82 @@ class LLMProvider:
         return body
 
     @staticmethod
-    def _raise_for_status(status_code: int) -> None:
+    def _error_details(payload: Any) -> dict[str, str | None]:
+        if not isinstance(payload, dict):
+            return {}
+        error = payload.get("error")
+        if not isinstance(error, dict):
+            error = payload
+        metadata = error.get("metadata")
+        if not isinstance(metadata, dict):
+            metadata = {}
+        return {
+            "provider_code": _safe_log_text(error.get("code"), 80) or None,
+            "provider_message": _safe_log_text(error.get("message")) or None,
+            "limit_source": _safe_log_text(metadata.get("limit_source"), 120) or None,
+            "upstream_provider": _safe_log_text(metadata.get("provider_name"), 120)
+            or None,
+            "remedy_hint": _safe_log_text(metadata.get("remedy_hint")) or None,
+        }
+
+    async def _raise_for_response(
+        self,
+        response: Any,
+        *,
+        model: str,
+        started: float,
+    ) -> None:
+        status_code = response.status_code
+        if status_code < 400:
+            return
+        request_id = response.headers.get("x-request-id")
+        retry_after = response.headers.get("retry-after")
+        details: dict[str, str | None] = {}
+        try:
+            raw = await response.aread()
+            details = self._error_details(json.loads(raw))
+        except (TypeError, ValueError):
+            pass
+        common = {
+            **details,
+            "request_id": request_id,
+            "retry_after": retry_after,
+        }
+        logger.warning(
+            "provider_http_error provider=%s model=%s status=%s duration_ms=%s "
+            "request_id=%s provider_code=%s limit_source=%s upstream_provider=%s "
+            "retry_after=%s provider_message=%s remedy_hint=%s",
+            self.name,
+            model,
+            status_code,
+            int((time.monotonic() - started) * 1000),
+            request_id,
+            details.get("provider_code"),
+            details.get("limit_source"),
+            details.get("upstream_provider"),
+            retry_after,
+            details.get("provider_message"),
+            details.get("remedy_hint"),
+        )
         if status_code in {401, 403}:
-            raise AuthenticationError(f"Provider rejected credential with HTTP {status_code}")
+            raise AuthenticationError(
+                f"Provider rejected credential with HTTP {status_code}", **common
+            )
         if status_code == 429:
-            raise RateLimitError()
+            raise RateLimitError(**common)
         if status_code >= 500:
             raise ProviderError(
-                f"Provider returned HTTP {status_code}", retryable=True, status_code=status_code
+                f"Provider returned HTTP {status_code}",
+                retryable=True,
+                status_code=status_code,
+                **common,
             )
         if status_code >= 400:
             raise ProviderError(
-                f"Provider returned HTTP {status_code}", retryable=False, status_code=status_code
+                f"Provider returned HTTP {status_code}",
+                retryable=False,
+                status_code=status_code,
+                **common,
             )
 
     @staticmethod
@@ -164,6 +303,17 @@ class LLMProvider:
         finish_reason: str | None = None
         usage = Usage()
 
+        logger.info(
+            "provider_request_started transport=http provider=%s model=%s timeout_seconds=%s "
+            "structured=%s message_count=%s max_output_tokens=%s",
+            self.name,
+            selected_model,
+            timeout,
+            response_schema is not None,
+            len(messages),
+            max_output_tokens,
+        )
+
         try:
             async with httpx.AsyncClient(timeout=timeout) as client:
                 async with client.stream(
@@ -178,8 +328,21 @@ class LLMProvider:
                         response_schema=response_schema,
                     ),
                 ) as response:
-                    self._raise_for_status(response.status_code)
                     request_id = response.headers.get("x-request-id")
+                    logger.info(
+                        "provider_response_received transport=http provider=%s model=%s "
+                        "status=%s request_id=%s duration_ms=%s",
+                        self.name,
+                        selected_model,
+                        response.status_code,
+                        request_id,
+                        int((time.monotonic() - started) * 1000),
+                    )
+                    await self._raise_for_response(
+                        response,
+                        model=selected_model,
+                        started=started,
+                    )
                     yield StreamEvent(
                         StreamEventType.CONNECTED,
                         self.name,
@@ -198,8 +361,25 @@ class LLMProvider:
                                 "Provider returned an invalid SSE event", retryable=False
                             ) from exc
                         if payload.get("error"):
+                            details = self._error_details(payload)
+                            logger.warning(
+                                "provider_sse_error provider=%s model=%s request_id=%s "
+                                "provider_code=%s limit_source=%s upstream_provider=%s "
+                                "provider_message=%s remedy_hint=%s",
+                                self.name,
+                                selected_model,
+                                request_id,
+                                details.get("provider_code"),
+                                details.get("limit_source"),
+                                details.get("upstream_provider"),
+                                details.get("provider_message"),
+                                details.get("remedy_hint"),
+                            )
                             raise ProviderError(
-                                "Provider returned an error SSE event", retryable=False
+                                "Provider returned an error SSE event",
+                                retryable=False,
+                                request_id=request_id,
+                                **details,
                             )
                         request_id = payload.get("id") or request_id
                         selected_model = payload.get("model") or selected_model
@@ -225,8 +405,22 @@ class LLMProvider:
                                 content=content,
                             )
         except httpx.TimeoutException as exc:
+            logger.warning(
+                "provider_request_failed transport=http provider=%s model=%s "
+                "error_type=timeout duration_ms=%s",
+                self.name,
+                selected_model,
+                int((time.monotonic() - started) * 1000),
+            )
             raise ProviderError("Provider stream timed out", retryable=True) from exc
         except httpx.NetworkError as exc:
+            logger.warning(
+                "provider_request_failed transport=http provider=%s model=%s "
+                "error_type=network duration_ms=%s",
+                self.name,
+                selected_model,
+                int((time.monotonic() - started) * 1000),
+            )
             raise ProviderError("Provider network request failed", retryable=True) from exc
 
         result = Response(
@@ -237,6 +431,20 @@ class LLMProvider:
             latency_ms=int((time.monotonic() - started) * 1000),
             usage=usage,
             finish_reason=finish_reason,
+        )
+        logger.info(
+            "provider_request_completed transport=http provider=%s model=%s request_id=%s "
+            "duration_ms=%s input_tokens=%s output_tokens=%s total_tokens=%s "
+            "finish_reason=%s response_chars=%s",
+            self.name,
+            selected_model,
+            request_id,
+            result.latency_ms,
+            usage.input_tokens,
+            usage.output_tokens,
+            usage.total_tokens,
+            finish_reason,
+            len(result.content),
         )
         yield StreamEvent(
             StreamEventType.COMPLETED,

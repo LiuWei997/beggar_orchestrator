@@ -7,7 +7,7 @@ from typing import Any
 
 from .lifecycle import AgentError
 from .messages import Message, normalize_messages
-from .providers import LLMProvider
+from .providers import Provider
 
 EventHandler = Callable[[dict[str, Any]], Awaitable[None] | None]
 
@@ -16,15 +16,19 @@ EventHandler = Callable[[dict[str, Any]], Awaitable[None] | None]
 class RouteTarget:
     provider: str
     model: str | None = None
-    priority: int = 100
     timeout_seconds: float = 30
 
 
 @dataclass(frozen=True, slots=True)
 class Route:
     targets: list[RouteTarget]
-    max_attempts: int = 3
     deadline_seconds: float = 60
+
+    def target_for(self, provider: str) -> RouteTarget | None:
+        return next(
+            (target for target in self.targets if target.provider == provider),
+            None,
+        )
 
 
 class ProviderRuntime:
@@ -34,7 +38,7 @@ class ProviderRuntime:
         self,
         *,
         system: str,
-        providers: dict[str, LLMProvider],
+        providers: dict[str, Provider],
         routes: dict[str, Route],
         on_event: EventHandler | None = None,
     ):

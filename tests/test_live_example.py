@@ -33,7 +33,7 @@ from beggar_orchestrator import Agent, Message, StreamEventType
 
 
 async def main() -> None:
-    """Ask one real question through the configured routing and retry policy."""
+    """Ask one real question through one explicitly selected provider."""
     agent = Agent(
         config_path=PROJECT_ROOT / "providers.toml",
         system=(
@@ -51,6 +51,7 @@ async def main() -> None:
     async with agent:
         async for event in agent.stream(
             route="general-chat",
+            provider="groq",
             messages=[Message.user(question)],
             temperature=0.2,
             max_output_tokens=800,

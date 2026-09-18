@@ -1,6 +1,6 @@
 # LLM API integration status
 
-Last reviewed: 2026-09-16
+Last reviewed: 2026-09-18
 
 This is the source of truth for upstream provider onboarding. A built-in preset is not considered usable until authentication and a real model request have both passed with the intended account.
 
@@ -9,7 +9,7 @@ This is the source of truth for upstream provider onboarding. A built-in preset 
 - `implementation-ready`: Provider class, credential reference and known protocol differences exist in code.
 - `auth-ready`: A credential is stored outside the repository and authentication verification passed.
 - `smoke-passed`: A minimal real model request completed and returned parseable usage data.
-- `route-ready`: Required structured-output behavior passed and the provider may enter a fallback group.
+- `route-ready`: Required structured-output behavior passed and the provider may be explicitly selected for a route.
 - `plain-only`: Authentication and plain completion passed, but structured output is not reliable.
 - `blocked`: A concrete account, region, permission or protocol issue prevents progress.
 
@@ -20,10 +20,11 @@ This is the source of truth for upstream provider onboarding. A built-in preset 
 | 1 | Groq | `groq` | `openai/gpt-oss-120b` | Bearer API key | passed | passed | passed | Plain and strict JSON Schema requests passed; reasoning models need at least a 128-token output budget for short answers |
 | 2 | OpenRouter | `openrouter` | `openrouter/free` | Bearer API key | passed | passed | model-dependent | Dynamic free-model router; the selected model and structured-output behavior may vary between requests |
 | 3 | Cohere | `cohere` | `command-a-plus-05-2026` | Bearer API key | passed | passed | plain-only | Free Trial key; plain completion works, but the current compatibility response was not directly parseable as required JSON |
+| 4 | Antigravity CLI | `agy` | `gemini-3.8-flash-low` | Local cached login | passed | passed | passed | Local NDJSON subprocess; native `--json-schema`; system instruction is encoded into the prompt because agy 1.2.6 has no `--system` flag |
 
 Groq remains the stable structured-output target. OpenRouter uses its dynamic free-model router,
 so structured-output support depends on the model selected for that request. Cohere is enabled only
-in the local `general-chat` plain-text fallback group. Provider implementations that have not
+for explicit selection in the local `general-chat` plain-text route. Provider implementations that have not
 completed a real model request are not retained.
 
 ## Removed providers
@@ -40,7 +41,7 @@ completed a real model request are not retained.
 | NVIDIA hosted NIM | Authentication and `/v1/models` passed; `moonshotai/kimi-k3` timed out at 30, 60 and 120 seconds, while `meta/llama-3.3-70b-instruct` was deprecated | Tested, but no usable hosted completion was available; implementation, configuration and local credentials were removed |
 | ModelScope International | `/v1/models` returned 34 models, but completion returned HTTP 401 requiring an Alibaba Cloud account binding | Tested, but the account was not inference-ready; no implementation was added and the local credential was removed |
 
-Credentials for removed providers were removed from the local plaintext fallback. No credential
+Credentials for removed providers were removed from the local plaintext store. No credential
 existed in the operating-system Keychain for ModelScope at cleanup time.
 
 ## New free-tier candidates
@@ -72,7 +73,7 @@ Complete these checks in order and record the outcome below:
 6. Send a short plain-text request with enough output budget for reasoning overhead; use at least 128 tokens for GPT-OSS.
 7. Send a small JSON-schema request using the workflow's real response shape.
 8. Confirm provider, model, request ID, token usage and latency appear in the final response/event.
-9. Trigger one controlled retryable failure and confirm fallback obeys the total deadline.
+9. Trigger one controlled failure and confirm the Agent stops without calling another provider.
 10. Change the provider status to `route-ready` only after all required checks pass.
 
 Authentication failures do not fall back to another provider because they indicate configuration problems. Never record a raw API key, browser cookie or authorization header in this file.
@@ -111,6 +112,7 @@ Add one row for every live attempt, including failures. Do not overwrite earlier
 | 2026-09-16 | NVIDIA hosted NIM | `meta/llama-3.3-70b-instruct` | Availability check | unavailable on hosted endpoint; absent from `/v1/models` and officially deprecated | under 1 s | none | use partner endpoint or self-hosted NIM |
 | 2026-09-16 | ModelScope International | `Qwen/Qwen3.5-35B-A3B` | Minimal completion | blocked; HTTP 401 requires binding an Alibaba Cloud account | under 1 s | none | credential removed after test |
 | 2026-09-16 | OpenRouter | `openrouter/free` | Package SSE verification after default change | passed through `nvidia/nemotron-3-ultra-550b-a55b:free` | 1,324 ms | 61 total | request ID present |
+| 2026-09-18 18:47 | Antigravity CLI | `gemini-3.8-flash-low` | Local NDJSON plus strict JSON Schema | passed; parsed exact `{\"ok\":true,\"value\":2}` response | 6,158 ms | 13,450 in / 33 out / 13,483 total | local conversation ID received |
 
 ## Provider references
 
@@ -131,3 +133,4 @@ Add one row for every live attempt, including failures. Do not overwrite earlier
 - Hugging Face Inference Providers pricing: <https://huggingface.co/docs/inference-providers/pricing>
 - GitHub Models retirement: <https://docs.github.com/en/github-models>
 - NVIDIA Kimi K3 hosted NIM: <https://build.nvidia.com/moonshotai/kimi-k3>
+- Antigravity CLI headless mode: <https://www.agy.dev/docs/cli/headless/>

@@ -5,12 +5,12 @@ Runtime 對外仍然只有三個概念：設定、一次性 Agent、Provider 實
 
 ```text
 agent.py          公開 Agent API 與 async context 資源管理
-execution.py      單次 SSE 執行、fallback、timeout、cancel 與結果保留
+execution.py      單一指定 Provider 的 SSE、timeout、cancel 與結果保留
 lifecycle.py      狀態、snapshot、transition 與狀態機規則
 messages.py       Message 型別、role 驗證與 system message 注入
 runtime.py        Provider/Route 集合與 lifecycle callback
 config.py         TOML cache、token 讀取、Provider/Route 建置、認證 CLI
-providers/        各 LLM API 的協定實作
+providers/        API 與本機 CLI 的 adapter 實作
 ```
 
 依賴方向是 `agent.py -> execution.py -> runtime.py/providers/`，狀態與訊息物件作為小型的
@@ -33,8 +33,8 @@ providers/        各 LLM API 的協定實作
 消費事件。正常讀完保留 `RUN_COMPLETED`；提早 break 或區塊拋錯時，context manager
 會關閉 active iterator、取消未完成 Agent，並保留 partial output 供離開區塊後讀取。
 
-Agent 按 priority 嘗試 route targets。只要第一個內容 delta 尚未出現，Provider 失敗
-就會 fallback；已開始輸出的 stream 直接終止，避免混入另一個模型的回答。
+呼叫端必須明確指定 Provider。Route 只確認該 Provider 是否允許並提供 model/timeout；
+Provider 不存在、額度不足或呼叫失敗時直接終止，不會 fallback。
 
 Agent 可透過 `status` 或 `snapshot()` 查詢即時生命週期，也可取消；終止後資料仍可讀，
 直到呼叫 `await agent.clear()` 釋放。`on_event` callback 會收到同一組生命週期變化，供
@@ -46,8 +46,6 @@ Agent 可透過 `status` 或 `snapshot()` 查詢即時生命週期，也可取�
 ```text
 RUN_CREATED -> INIT_FAILED
 RUN_CREATED -> ATTEMPT_STARTED -> CONNECTED -> RUN_COMPLETED
-                    ^              |
-                    |--------------|  尚未輸出內容時換下一個 Provider
 
 RUN_CREATED / ATTEMPT_STARTED / CONNECTED -> RUN_CANCELLED
 RUN_CREATED / ATTEMPT_STARTED / CONNECTED -> RUN_TIMED_OUT
@@ -59,8 +57,17 @@ RUN_CREATED / ATTEMPT_STARTED / CONNECTED -> OUT_OF_USAGE
 
 ## Providers
 
-`LLMProvider` 實作共用 OpenAI-compatible SSE 解析。Groq、OpenRouter、Cohere 各自只
-定義 endpoint、預設模型、headers 及 structured-output 差異。
+Runtime 只依賴公開的 `Provider` protocol，因此 route 與 `AgentExecution` 不需要知道
+後端是 HTTP API 或本機 subprocess。`LLMProvider` 實作共用 OpenAI-compatible SSE；
+`CLIProvider` 負責 subprocess 啟停與取消；`AgyProvider` 再處理 Antigravity 的 NDJSON、
+cached login、JSON Schema 與 usage 格式。未來新增 CLI 時只需實作同一個 `Provider`
+contract，不必修改 Agent 執行或狀態機。
 
 套件不負責 Web server、Prompt 資料庫、conversation persistence 或自動執行 tools。
 外部 workflow 擁有完整訊息歷史，`tool` role 目前代表已執行工具的結果。
+
+## Observability
+
+設定載入、明確 Provider 選擇、HTTP/CLI transport、狀態機轉換
+與最終結果都有固定名稱的結構化 log。`agent_id` 是跨層關聯鍵；Provider request ID 或
+CLI conversation ID 則用於對照上游。欄位與安全限制見 [Observability](observability.md)。

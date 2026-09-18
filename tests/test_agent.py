@@ -9,7 +9,6 @@ from beggar_orchestrator import (
     AgentClearedError as RunClearedError,
     AgentError,
     AgentStatus as RunStatus,
-    AllProvidersFailed,
     InvalidAgentTransitionError as InvalidRunTransitionError,
     Message,
 )
@@ -88,6 +87,7 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
 
         result = await agent.start(
             route="chat",
+            provider="primary",
             messages=[
                 Message.user("question"),
                 Message.assistant("working"),
@@ -101,30 +101,53 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
             {"role": "system", "content": "system rules"},
         )
 
-    async def test_failure_falls_back_before_output(self):
+    async def test_logs_attempt_and_state_without_message_content(self):
+        provider = FakeProvider("primary", ["ok"])
+        agent = make_agent({"primary": provider}, [RouteTarget("primary")])
+
+        with self.assertLogs("beggar_orchestrator.execution", level="INFO") as captured:
+            await agent.start(
+                route="chat",
+                provider="primary",
+                messages=[Message.user("private transcript fragment")],
+                request_id="job-123",
+            )
+
+        logs = "\n".join(captured.output)
+        self.assertIn("agent_attempt_started agent_id=job-123", logs)
+        self.assertIn("agent_attempt_succeeded agent_id=job-123", logs)
+        self.assertIn("agent_state_changed agent_id=job-123", logs)
+        self.assertNotIn("private transcript fragment", logs)
+
+    async def test_failure_does_not_fall_back(self):
         first = FakeProvider("first", [ProviderError("busy", retryable=True)])
         second = FakeProvider("second", ["ok"])
         agent = make_agent(
             {"first": first, "second": second},
-            [RouteTarget("first", priority=1), RouteTarget("second", priority=2)],
+            [RouteTarget("first"), RouteTarget("second")],
         )
 
-        result = await agent.start(route="chat", messages=[Message.user("hello")])
+        with self.assertRaises(ProviderError):
+            await agent.start(
+                route="chat", provider="first", messages=[Message.user("hello")]
+            )
 
-        self.assertEqual(result.provider, "second")
         self.assertEqual(first.calls, 1)
-        self.assertEqual(second.calls, 1)
+        self.assertEqual(second.calls, 0)
 
-    async def test_authentication_failure_also_falls_back(self):
+    async def test_authentication_failure_does_not_fall_back(self):
         first = FakeProvider("first", [AuthenticationError()])
         second = FakeProvider("second", ["ok"])
         agent = make_agent(
             {"first": first, "second": second},
-            [RouteTarget("first", priority=1), RouteTarget("second", priority=2)],
+            [RouteTarget("first"), RouteTarget("second")],
         )
 
-        result = await agent.start(route="chat", messages=[Message.user("hello")])
-        self.assertEqual(result.provider, "second")
+        with self.assertRaises(AuthenticationError):
+            await agent.start(
+                route="chat", provider="first", messages=[Message.user("hello")]
+            )
+        self.assertEqual(second.calls, 0)
 
     async def test_stream_exposes_connection_delta_and_completion(self):
         provider = FakeProvider("primary", ["hello"])
@@ -133,7 +156,7 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         events = [
             event
             async for event in agent.stream(
-                route="chat", messages=[Message.user("hello")]
+                route="chat", provider="primary", messages=[Message.user("hello")]
             )
         ]
 
@@ -146,7 +169,9 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         agent = make_agent({"primary": provider}, [RouteTarget("primary")])
 
         self.assertEqual(agent.status, RunStatus.RUN_CREATED)
-        response = await agent.start(route="chat", messages=[Message.user("hello")])
+        response = await agent.start(
+            route="chat", provider="primary", messages=[Message.user("hello")]
+        )
 
         self.assertEqual(response.content, "hello")
         self.assertEqual(agent.status, RunStatus.RUN_COMPLETED)
@@ -161,7 +186,9 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
         with self.assertRaises(RunAlreadyStartedError):
-            await agent.start(route="chat", messages=[Message.user("again")])
+            await agent.start(
+                route="chat", provider="primary", messages=[Message.user("again")]
+            )
         with self.assertRaises(InvalidRunTransitionError):
             await agent._execution.transition_to(RunStatus.ATTEMPT_STARTED)
 
@@ -175,23 +202,54 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         agent = make_agent(
             {"primary": provider}, [RouteTarget("primary")], on_event=capture
         )
-        await agent.start(route="chat", messages=[Message.user("hello")])
+        await agent.start(
+            route="chat", provider="primary", messages=[Message.user("hello")]
+        )
 
         self.assertEqual(
             lifecycle_events,
             ["attempt_started", "connected", "run_completed"],
         )
 
-    async def test_all_provider_failures_become_out_of_usage(self):
+    async def test_selected_provider_failure_becomes_out_of_usage(self):
         first = FakeProvider("first", [ProviderError("busy", retryable=True)])
         second = FakeProvider("second", [AuthenticationError()])
         agent = make_agent(
             {"first": first, "second": second},
-            [RouteTarget("first", priority=1), RouteTarget("second", priority=2)],
+            [RouteTarget("first"), RouteTarget("second")],
         )
 
-        with self.assertRaises(AllProvidersFailed):
-            await agent.start(route="chat", messages=[Message.user("hello")])
+        with self.assertRaises(AuthenticationError):
+            await agent.start(
+                route="chat", provider="second", messages=[Message.user("hello")]
+            )
+
+        self.assertEqual(agent.status, RunStatus.OUT_OF_USAGE)
+        self.assertEqual(first.calls, 0)
+        self.assertEqual(second.calls, 1)
+
+    async def test_provider_not_allowed_by_route_fails_immediately(self):
+        primary = FakeProvider("primary", ["unused"])
+        agent = make_agent({"primary": primary}, [RouteTarget("other")])
+
+        with self.assertRaisesRegex(AgentError, "not allowed"):
+            await agent.start(
+                route="chat", provider="primary", messages=[Message.user("hello")]
+            )
+
+        self.assertEqual(primary.calls, 0)
+        self.assertEqual(agent.status, RunStatus.OUT_OF_USAGE)
+
+    async def test_missing_provider_fails_immediately(self):
+        agent = make_agent(
+            {"primary": FakeProvider("primary", ["unused"])},
+            [RouteTarget("missing")],
+        )
+
+        with self.assertRaisesRegex(AgentError, "not configured or is disabled"):
+            await agent.start(
+                route="chat", provider="missing", messages=[Message.user("hello")]
+            )
 
         self.assertEqual(agent.status, RunStatus.OUT_OF_USAGE)
 
@@ -214,7 +272,9 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(agent.status, RunStatus.INIT_FAILED)
         self.assertTrue(agent.is_terminal)
         with self.assertRaises(AgentError):
-            await agent.start(route="chat", messages=[Message.user("hello")])
+            await agent.start(
+                route="chat", provider="missing", messages=[Message.user("hello")]
+            )
 
     async def test_missing_config_is_init_failed_instead_of_constructor_error(self):
         agent = Agent(system="system rules", config_path="does-not-exist.toml")
@@ -228,7 +288,7 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
 
         async def consume():
             async for event in agent.stream(
-                route="chat", messages=[Message.user("hello")]
+                route="chat", provider="slow", messages=[Message.user("hello")]
             ):
                 if event.type is StreamEventType.CONTENT_DELTA:
                     received_output.set()
@@ -251,7 +311,7 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
             events = [
                 event
                 async for event in agent.stream(
-                    route="chat", messages=[Message.user("hello")]
+                    route="chat", provider="primary", messages=[Message.user("hello")]
                 )
             ]
 
@@ -263,7 +323,7 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
 
         async with agent:
             async for event in agent.stream(
-                route="chat", messages=[Message.user("hello")]
+                route="chat", provider="slow", messages=[Message.user("hello")]
             ):
                 if event.type is StreamEventType.CONTENT_DELTA:
                     break
@@ -277,7 +337,7 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(RuntimeError, "consumer failed"):
             async with agent:
                 async for event in agent.stream(
-                    route="chat", messages=[Message.user("hello")]
+                    route="chat", provider="slow", messages=[Message.user("hello")]
                 ):
                     if event.type is StreamEventType.CONTENT_DELTA:
                         raise RuntimeError("consumer failed")
@@ -292,7 +352,7 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
             events = [
                 event
                 async for event in agent.stream(
-                    route="chat", messages=[Message.user("hello")]
+                    route="chat", provider="primary", messages=[Message.user("hello")]
                 )
             ]
         self.assertTrue(events)

@@ -22,6 +22,7 @@ async def print_stream(agent, enough_output: asyncio.Event) -> None:
     try:
         async for event in agent.stream(
             route="general-chat",
+            provider="groq",
             messages=[Message.user("詳細說明 Kubernetes 高可用架構")],
             max_output_tokens=1_500,
         ):

@@ -104,6 +104,7 @@ class Agent:
         self,
         *,
         route: str,
+        provider: str,
         messages: Iterable[Message | Mapping[str, Any]],
         temperature: float | None = None,
         max_output_tokens: int | None = None,
@@ -112,6 +113,7 @@ class Agent:
     ) -> Response:
         self._configure_request(
             route=route,
+            provider=provider,
             messages=messages,
             temperature=temperature,
             max_output_tokens=max_output_tokens,
@@ -124,6 +126,7 @@ class Agent:
         self,
         *,
         route: str,
+        provider: str,
         messages: Iterable[Message | Mapping[str, Any]],
         temperature: float | None = None,
         max_output_tokens: int | None = None,
@@ -132,6 +135,7 @@ class Agent:
     ) -> AsyncIterator[StreamEvent]:
         self._configure_request(
             route=route,
+            provider=provider,
             messages=messages,
             temperature=temperature,
             max_output_tokens=max_output_tokens,
@@ -172,6 +176,7 @@ class Agent:
         self,
         *,
         route: str,
+        provider: str,
         messages: Iterable[Message | Mapping[str, Any]],
         temperature: float | None,
         max_output_tokens: int | None,
@@ -180,6 +185,7 @@ class Agent:
     ) -> None:
         self._execution.configure_request(
             route=route,
+            provider=provider,
             messages=messages,
             temperature=temperature,
             max_output_tokens=max_output_tokens,

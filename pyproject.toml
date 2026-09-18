@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "beggar-orchestrator"
-version = "0.1.2"
-description = "A small, provider-neutral Python router for LLM model APIs."
+version = "0.3.0"
+description = "A small, provider-neutral Python router for LLM APIs and local CLIs."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [

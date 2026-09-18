@@ -6,13 +6,15 @@ from .lifecycle import (
     AgentSnapshot,
     AgentStatus,
     AgentTransition,
-    AllProvidersFailed,
     InvalidAgentTransitionError,
 )
 from .messages import Message
 from .config import ConfigError
 from .providers import (
+    AgyProvider,
     AuthenticationError,
+    CLIProvider,
+    Provider,
     ProviderError,
     RateLimitError,
     Response,
@@ -23,18 +25,20 @@ from .providers import (
 
 __all__ = [
     "Agent",
+    "AgyProvider",
     "AgentAlreadyStartedError",
     "AgentClearedError",
     "AgentError",
     "AgentSnapshot",
     "AgentStatus",
     "AgentTransition",
-    "AllProvidersFailed",
     "AuthenticationError",
+    "CLIProvider",
     "ConfigError",
     "InvalidAgentTransitionError",
     "Message",
     "ProviderError",
+    "Provider",
     "RateLimitError",
     "Response",
     "StreamEvent",
